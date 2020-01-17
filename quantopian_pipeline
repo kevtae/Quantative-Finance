@@ -1,0 +1,251 @@
+from quantopian.algorithm import attach_pipeline, pipeline_output, order_optimal_portfolio
+from quantopian.pipeline import Pipeline
+from quantopian.pipeline.data.builtin import USEquityPricing
+from quantopian.pipeline.data import Fundamentals, psychsignal
+from quantopian.pipeline.factors import AnnualizedVolatility, SimpleBeta, Returns, MACDSignal, CustomFactor, ExponentialWeightedMovingAverage
+import quantopian.optimize as opt
+from quantopian.pipeline.experimental import risk_loading_pipeline
+from quantopian.pipeline.filters import QTradableStocksUS 
+from sklearn import preprocessing
+from scipy.stats.mstats import winsorize
+from quantopian.pipeline.classifiers.morningstar import Sector  
+
+
+from zipline.utils.numpy_utils import (
+    repeat_first_axis,
+    repeat_last_axis,
+)
+
+##do analysis? https://www.quantopian.com/posts/quantopian-lecture-series-factor-analysis
+
+#need to divide into decile instead of num of positions
+#figure out rebalance function
+
+import numpy as np
+
+MAX_GROSS_EXPOSURE = 1.0
+NUM_POSITIONS = 400
+MAX_POSITION_SIZE = 400/NUM_POSITIONS
+
+#BETA = relative volatility
+MIN_BETA_EXPOSURE = -0
+MAX_BETA_EXPOSURE= 0
+
+# Factor preprocessing settings
+WIN_LIMIT = 0.025 # factor preprocess winsorize limit
+
+#z-score
+def preprocess(a):
+    
+    # find inf and -inf and replace with nan
+    inds = np.where(np.isinf(a))
+    a[inds] = np.nan
+    
+    # demean and replace nans with 0
+    a = np.nan_to_num((a-np.nanmean(a)))
+    #get rid of outliers
+    a = winsorize(a,limits=(WIN_LIMIT,WIN_LIMIT))
+    #calculate z-score
+    return preprocessing.scale(a)
+
+#slope
+def slope(df):     
+    return smx.OLS(df, smx.add_constant(range(-len(df) + 1, 1))).fit().params[-1]
+
+#make all the factors
+def make_features():
+    
+    class Trendline(CustomFactor):
+        inputs = [USEquityPricing.close]
+        window_length = 252
+ 
+        _x = np.arange(window_length)
+        _x_var = np.var(_x)
+ 
+        def compute(self, today, assets, out, close):
+            x_matrix = repeat_last_axis(
+                (self.window_length - 1) / 2 - self._x,
+                len(assets),
+            )
+ 
+            y_bar = np.nanmean(close, axis=0)
+            y_bars = repeat_first_axis(y_bar, self.window_length)
+            y_matrix = close - y_bars
+ 
+            out[:] = preprocess(np.divide(
+                (x_matrix * y_matrix).sum(axis=0) / self._x_var,
+                self.window_length)
+            )
+    
+    class PriceOscillator(CustomFactor):
+        inputs = (USEquityPricing.close,)
+        window_length = 252
+ 
+        def compute(self, today, assets, out, close):
+            four_week_period = close[-20:]
+            out[:] = preprocess(np.divide(
+                np.nanmean(four_week_period, axis=0),
+                np.nanmean(close, axis=0))-1)
+    
+     
+    class returns_39w(CustomFactor):
+        inputs = [Returns(window_length=215)]
+        window_length = 1
+        
+        def compute(self, today, assets, out, returns):
+            out[:] = preprocess(returns[-1,:])
+       
+    class percentAbove(CustomFactor):
+        window_length = 260
+        inputs = [USEquityPricing.close]  
+
+        #get the min of 260 days and find the percentage
+        def compute(self,today,assets,out,close):
+            low = np.nanmin(close, axis = 0)
+            out[:]=preprocess(((close[0] - low) / low) * 100)
+    
+    class vpt(CustomFactor):
+        window_length = 255
+        inputs = [USEquityPricing.close, USEquityPricing.volume]  
+    
+        def compute(self,today,assets,out,close, volume):
+            dailyReturn = (close[-1] - close[0]) / close[0]
+            out[:] = preprocess(volume[0] * dailyReturn)
+    
+    return {
+        '52 week trendline' : Trendline,
+        '4/52 week price oscillator':PriceOscillator,
+        '39 week return' : returns_39w,
+        '51 week ovlume price trend': vpt,
+        'percent above 260 day low': percentAbove,
+        }
+
+def make_pipeline():
+    universe = QTradableStocksUS() & Sector().eq(311)
+
+
+    #BETA on SPY etf
+    beta = SimpleBeta(target=sid(8554),regression_length=260,
+                      allowed_missing_percentage=1.0
+                     )
+    
+    features = make_features()
+    
+    combined_alpha = None
+    for name, f in features.iteritems():
+        if combined_alpha == None:
+            combined_alpha = f(mask=universe)
+        else:
+            combined_alpha += f(mask=universe)
+            
+            
+    # lower, upper = results['returns'].quantile([.05, .95])
+    longs = combined_alpha.percentile_between(90,100,mask=universe)
+    shorts = combined_alpha.percentile_between(0,10,mask=universe)
+    
+    long_short_screen = (longs | shorts)
+
+    pipe = Pipeline(columns = {
+        'combined_alpha':combined_alpha,
+        'beta':beta,
+    },
+    screen = long_short_screen
+                   )
+    return pipe
+
+def initialize(context):
+    attach_pipeline(make_pipeline(), 'long_short')
+    attach_pipeline(risk_loading_pipeline(), 'risk_loading_pipeline')
+
+    schedule_function(func=rebalance,
+                     date_rule=date_rules.month_start(days_offset=0),
+                      time_rule=time_rules.market_open(minutes=60),
+                      half_days=True)
+    # record my portfolio variables at the end of day
+    schedule_function(func=recording_statements,
+                     date_rule=date_rules.month_start(days_offset=0),
+                      time_rule=time_rules.market_close(),
+                      half_days=True)
+    # schedule_function(monthly_return, date_rules.month_end(), time_rules.market_close())
+    # context.longleverage = 1.0
+    # context.shortleverage = -1.0
+# def monthly_return(context, data):  
+#     pipeline_data = context.pipeline_data
+ 
+#     # demean and normalize
+#     combined_alpha = pipeline_data.combined_alpha
+#     combined_alpha = combined_alpha - combined_alpha.mean()
+#     combined_alpha = combined_alpha/combined_alpha.abs().sum()
+    
+#     objective = opt.MaximizeAlpha(combined_alpha)
+#     bars_d = (N_PERIODS + 1)*DAYS_IN_PERIOD  
+#     Monthly_Close = data.history(combined_alpha, 'close', bars_d, '1d').resample('M').last() 
+#     Monthly_Returns = Monthly_Close.pct_change()[-N_PERIODS:]
+
+#     print Monthly_Returns  
+    
+def before_trading_start(context, data):
+ 
+    context.pipeline_data = pipeline_output('long_short')
+    context.risk_loading_pipeline = pipeline_output('risk_loading_pipeline')
+    
+def recording_statements(context, data):
+ 
+    record(num_positions=len(context.portfolio.positions))
+    record(leverage=context.account.leverage)
+
+def rebalance(context, data):
+
+    
+    # for stock in pipeline_data.shorts.index:
+    #     if stock in data:
+    #         order_target_percent(stock, context.shortleverage/ len(pipeline_data.shorts))
+
+    # for stock in pipeline_data.longs.index:
+    #     if stock in data:
+    #         order_target_percent(stock, context.longleverage / len(pipeline_data.longs))
+            
+    # for stock in context.portfolio.positions:
+    #     if stock not in pipeline_data.longs.index and \
+    #       stock not in pipeline_data.shorts.index:
+    #         order_target(stock, 0)
+ 
+    pipeline_data = context.pipeline_data
+ 
+    # demean and normalize
+    combined_alpha = pipeline_data.combined_alpha
+    combined_alpha = combined_alpha - combined_alpha.mean()
+    combined_alpha = combined_alpha/combined_alpha.abs().sum()
+    
+    objective = opt.MaximizeAlpha(combined_alpha)
+    
+    constraints = []
+    
+    constraints.append(opt.MaxGrossExposure(MAX_GROSS_EXPOSURE))
+    
+    constraints.append(opt.DollarNeutral())
+    
+    constraints.append(
+        opt.PositionConcentration.with_equal_bounds(
+            min=-MAX_POSITION_SIZE,
+            max=MAX_POSITION_SIZE
+        ))
+    
+    beta_neutral = opt.FactorExposure(
+        loadings=pipeline_data[['beta']],
+        min_exposures={'beta':MIN_BETA_EXPOSURE},
+        max_exposures={'beta':MAX_BETA_EXPOSURE}
+        )
+    constraints.append(beta_neutral)
+    
+    risk_model_exposure = opt.experimental.RiskModelExposure(
+        context.risk_loading_pipeline.dropna(),
+        version=opt.Newest,
+    )
+      
+    constraints.append(risk_model_exposure)
+    
+    order_optimal_portfolio(
+                objective=objective,
+                constraints=constraints,
+                )
